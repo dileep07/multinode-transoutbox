@@ -78,16 +78,19 @@ Example: 6 partitions, 3 nodes
 
 ## 4. Database Schema Changes
 
-### 4.1 New Table: outbox_nodes
-```sql
-CREATE TABLE outbox_nodes (
-    node_id VARCHAR(255) PRIMARY KEY,
-    last_heartbeat TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-);
+### 4.1 Reuse Existing ShedLock Table
+No new tables needed! We'll use the existing ShedLock table for node registration:
 
-CREATE INDEX idx_outbox_nodes_heartbeat ON outbox_nodes(last_heartbeat);
+```sql
+-- ShedLock table (already exists)
+-- We'll use lock_name pattern: "node-heartbeat-{nodeId}"
+-- The locked_at timestamp serves as our heartbeat
+-- The locked_until tells us when the node expires
+
+-- Example entries:
+-- lock_name: "node-heartbeat-pod-abc123"  
+-- locked_at: 2024-01-15 10:30:00
+-- locked_until: 2024-01-15 10:32:00  (heartbeat + 2 minutes)
 ```
 
 ### 4.2 Modified Table: outbox_events
@@ -118,19 +121,46 @@ public class PartitionAssignmentService {
 - `outbox.node.id`: Unique node identifier (defaults to hostname/UUID)
 - `outbox.total.partitions`: Total number of partitions (default: 6)
 
-### 5.2 NodeRegistryService
+### 5.2 NodeRegistryService (ShedLock-based)
 
 ```java
 @Service 
 public class NodeRegistryService {
-    public void updateNodeRegistry();
-    public Set<String> getActiveNodes();
+    private static final String NODE_HEARTBEAT_PREFIX = "node-heartbeat-";
+    private static final Duration NODE_TIMEOUT = Duration.ofMinutes(2);
+    
+    private final ShedLockTemplate shedLockTemplate;
+    private final LockProvider lockProvider;
+    
+    public void updateNodeHeartbeat(String nodeId) {
+        // Use ShedLock to register/update node heartbeat
+        String lockName = NODE_HEARTBEAT_PREFIX + nodeId;
+        
+        LockConfiguration lockConfig = new LockConfiguration(
+            Instant.now(),
+            lockName, 
+            NODE_TIMEOUT,        // locked_until = now + 2 minutes
+            Duration.ofSeconds(1) // locked_at_least_for
+        );
+        
+        shedLockTemplate.executeWithLock(() -> {
+            // This execution updates the heartbeat automatically
+            log.debug("Heartbeat updated for node: {}", nodeId);
+        }, lockConfig);
+    }
+    
+    public Set<String> getActiveNodes() {
+        // Query ShedLock table for active node heartbeats
+        return lockProvider.findActiveNodeLocks(NODE_HEARTBEAT_PREFIX, Instant.now());
+    }
 }
 ```
 
-**Scheduled Tasks**:
-- Heartbeat update: Every 30 seconds
-- Node cleanup: Nodes inactive for 2+ minutes
+**Benefits of ShedLock approach**:
+- **No table bloat**: Expired locks are automatically cleaned up
+- **Reuse existing infrastructure**: No new tables or maintenance
+- **Atomic operations**: Lock acquisition = heartbeat update
+- **Built-in expiration**: `locked_until` serves as node timeout
 
 ### 5.3 TransactionOutboxProcessor (Modified)
 
@@ -262,7 +292,7 @@ log.warn("Node {} not responding, rebalancing partitions", failedNodeId);
 - **Connection Timeouts**: Retry with exponential backoff
 - **Lock Acquisition Failures**: Skip partition processing cycle
 
-### 10.2 Kafka Failures  
+### 10.2 Kafka Failures
 - **Producer Errors**: Mark events as failed, retry later
 - **Broker Unavailable**: Circuit breaker pattern
 - **Serialization Errors**: Dead letter queue for problematic events
@@ -366,7 +396,7 @@ log.warn("Node {} not responding, rebalancing partitions", failedNodeId);
 - **Latency**: <10% increase in P95 processing time
 - **Availability**: >99.9% uptime during node failures
 
-### 16.2 Operational Metrics  
+### 16.2 Operational Metrics
 - **Zero Data Loss**: All events processed exactly once
 - **Fast Recovery**: <2 minutes for node failure detection
 - **Smooth Scaling**: Linear throughput scaling with node count

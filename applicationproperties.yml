@@ -1,0 +1,13 @@
+outbox:
+  node:
+    id: '${HOSTNAME:#{T(java.util.UUID).randomUUID().toString()}}'
+  total:
+    partitions: 6
+  task:
+    scheduler:
+      publish:
+        fixedRate: 10000
+        initialDelay: 10000
+      heartbeat:
+        fixedRate: 30000
+        lockAtLeastFor: PT29S
